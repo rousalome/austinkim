@@ -1,0 +1,218 @@
+커널 패닉이 났어요.
+네트워크 드라이버 리눅스 커널 코드에서 발생한 것 같은데요. 음.
+일단 당황하지 마시구요. 차근 차근 커널 로그와 코어 덤프를 살펴보면, 정답이 나와요.
+
+일단 커널 로그를 보면, 프로그램 카운터가 0x0을 가르키고 있네요.
+음... 그리고
+링크 레지스터(R14)가 0xc0adc274(LR is at xfrm_local_error+0x4c/0x58) 을 가르키고 있습니다.
+[  262.401303] Unable to handle kernel NULL pointer dereference at virtual address 00000000
+[  262.401365] pgd = dbdc4000
+[  262.401389] [00000000] *pgd=00000000
+[  262.401433] Internal error: Oops: 80000005 [#1] PREEMPT SMP ARM
+[  262.401459] Modules linked in:
+[  262.401495] CPU: 0 PID: 7107 Comm: Framework Tainted: G        W    3.10.49-g356bd9f-00007-gadca646 #1
+[  262.401522] task: da6b0540 ti: d9412000 task.ti: d9412000
+[  262.401549] PC is at 0x0
+[  262.401590] LR is at xfrm_local_error+0x4c/0x58
+[  262.401619] pc : [<00000000>]    lr : [<c0adc274>]    psr: a00f0013
+[  262.401619] sp : d9413c68  ip : c0ac6c20  fp : 0000dd86
+[  262.401654] r10: 0000010e  r9 : 0000010a  r8 : de0ddc20
+[  262.401678] r7 : c13ddf00  r6 : 00000500  r5 : d9094540  r4 : c13e3780
+[  262.401703] r3 : 00000000  r2 : 00000001  r1 : 00000500  r0 : d9094540
+
+일단 커널 로그에서 R14가 가르키는(커널 패닉이 발생한 함수를 호출한) 주소로 가보면요. 
+R3를 branch instruction으로 수행하고 있었습니다. 이런 Instruction은 함수 포인터로 함수를 호출할 때 쓰이죠.
+그런데 커널 로그에서 R3이 0x0이라고 하네요.
+   NSR:C0ADC264|E1A00005            cpy     r0,r5            ; proto,skb
+   NSR:C0ADC268|E594344C            ldr     r3,[r4,#0x44C]
+   NSR:C0ADC26C|E1A01006            cpy     r1,r6            ; r1,mtu
+   NSR:C0ADC270|E12FFF33            blx     r3  //<<--
+   
+아 이제, 커널 로그가 가르키는 스택 주소 0xd9413c68로 좀 가볼까요?
+d.v %y.l 0xD9413C68
+______address|_data________|value_____________|symbol
+NSD:D9413C60| 13 00 0F A0  0xA00F0013
+NSD:D9413C64| FF FF FF FF  0xFFFFFFFF
+NSD:D9413C68| 40 45 09 D9  0xD9094540    // <<-R4 
+NSD:D9413C6C| 00 0C 42 DC  0xDC420C00   //<<--R5 
+NSD:D9413C70| 40 45 09 D9  0xD9094540     //<<-- R6
+NSD:D9413C74| 0C 11 AD C0  0xC0AD110C         \\vmlinux\xfrm4_output\__xfrm4_output+0xE4  //<<--R14
+NSD:D9413C78| 00 00 00 00  0x0
+NSD:D9413C7C| 01 00 00 00  0x1
+NSD:D9413C80| 00 0C 42 DC  0xDC420C00
+NSD:D9413C84| 6C C0 AD C0  0xC0ADC06C         \\vmlinux\xfrm_output\xfrm_output_resume+0x41C
+
+@D9413C74 스택 주소를 보니, 0xC0AD110C 즉 __xfrm4_output+0xE4 주소를 볼 수 있는데요.
+0xC0AD110C 주소를 가보니, xfrm_local_error란 함수를 branch operation으로 수행을 하네요.
+______addr/line|code_____|label____|mnemonic________________|comment
+    NSR:C0AD1104|E1A00004            cpy     r0,r4            ; r0,skb
+   NSR:C0AD1108|EB002C46            bl      0xC0ADC228       ; xfrm_local_error
+
+xfrm_local_error() 함수 초반 ARM Instruction을 보면, R14, R6, R5, R4 순으로 스택에 Push를 하네요.   
+   NSR:C0ADC228|E92D4070  xfrm_local_error:    push    {r4-r6,r14}
+   NSR:C0ADC22C|E1A05000                       cpy     r5,r0            ; skb,pr
+   
+예를 들면, 이런 거죠. 스택에 이렇게 Push를 하고나면 새로운 스택 주소는 D9413C68(<-D9413C74)가 되는거죠.
+stack 주소
+D9413C68  R4을 스택에 Push       =>> 0xD9094540
+D9413C6C  R5을 스택에 Push       =>> 0xDC420C00
+D9413C70  R6을 스택에 Push       =>> 0xD9094540
+D9413C74  R14 주소 스택에 Push =>>  0xC0AD110C
+ 
+이렇게 새로운 함수가 호출될 때 스택에 파라미터를 Push하는 규칙은 CPU 아키텍쳐마다 다르거든요.
+위의 경우에는 ARM32 아키텍처 Calling Convention에 따른 거에요.
+
+ARM 스팩 문서를 보시면 위 내용이 자세히 나와 있어요.
+
+자 다시 커널 로그로 돌아가 봅시다.
+[  262.401495] CPU: 0 PID: 7107 Comm: BaldTainted: G        W    3.10.49-g356bd9f-00007-gadca646 #1
+[  262.401522] task: da6b0540 ti: d9412000 task.ti: d9412000
+[  262.401549] PC is at 0x0
+[  262.401590] LR is at xfrm_local_error+0x4c/0x58
+[  262.401619] pc : [<00000000>]    lr : [<c0adc274>]    psr: a00f0013
+[  262.401619] sp : d9413c68  ip : c0ac6c20  fp : 0000dd86
+
+T32 프로그램으로, 
+커널 로그에서 찍힌 LR을 프로그램 카운터로 설정하고, 스택 주소는 그대로 설정 그리고 위 스택 정보에서 살펴본 0xC0AD110C(__xfrm4_output+0xE4) 주소를
+설정하면. 이렇게 이쁘게 콜 스택이 보이네요.
+
+-000|xfrm_local_error(skb = 0xDCD376C0, mtu = -611987776)
+-001|__xfrm4_output(skb = 0xD9094540)
+-002|xfrm_output_resume(skb = 0xD9094540, err = 1)
+-003|__xfrm4_output(skb = 0xD9094540)
+-004|ip_local_out(skb = 0xD9094540)
+-005|ip_send_skb(net = 0xC13DDF00, ?)
+-006|udp_send_skb(skb = 0xD9094540, ?)
+-007|udp_sendmsg(?, sk = 0xDE0F1680, msg = 0xD9413EE0, len = 1300)
+-008|inet_sendmsg(iocb = 0xD9413E58, ?, msg = 0xD9413EE0, size = 1300)
+-009|sock_sendmsg(sock = 0xDA9A5500, msg = 0xD9413EE0, size = 1300)
+-010|SYSC_sendto(inline)
+-010|sys_sendto(?, buff = -1997588480, ?, ?, addr = -1985806992, addr_len = 16)
+-011|ret_fast_syscall(asm)
+
+T32 명령어는 아래와 같아요.
+r.s R13  0xD9413C68
+r.s R14 0xC0AD110C
+r.s PC   0xC0ADC270
+   
+0xC0ADC270 주소에 다시 가볼까요? R3가 어떻게 0x0으로 업데이트되는지 봐야겠죠.  
+확인해보니, ldr     r3,[r4,#0x44C] 명령어로 업데이트 되네요. 
+   NSR:C0ADC264|E1A00005                        cpy     r0,r5            ; proto,skb
+   NSR:C0ADC268|E594344C                        ldr     r3,[r4,#0x44C]
+   NSR:C0ADC26C|E1A01006                        cpy     r1,r6            ; r1,mtu
+   NSR:C0ADC270|E12FFF33                        blx     r3
+   
+0xC0ADC270 주소로 실제 소스 코드 위치를 알면 좋을 상황인데요. T32에서 이런 상황에서 아주 유용한 커맨드를 제공해요.
+y.l.line 0xC0ADC270   
+__________address________|module__________________________________|source________|line______|o
+     P:C0ADC25C--C0ADC263|\\vmlinux\xfrm_output                   |.1/android/kernel/net/xfrm/xfrm_output.c|\247--247          |
+     P:C0ADC264--C0ADC273|\\vmlinux\xfrm_output                   |.1/android/kernel/net/xfrm/xfrm_output.c|\248--250          |
+    
+음, kernel/net/xfrm/xfrm_output.c의 248--250  라인인 것 같네요. 
+역시나, 실제 소스 코드를 보면 함수 포인터(콜백 함수 형태)로 함수를 호출하고 있네요.
+234void xfrm_local_error(struct sk_buff *skb, int mtu)
+235{
+236	unsigned int proto;
+237	struct xfrm_state_afinfo *afinfo;
+238
+// ...생략...
+245
+246	afinfo = xfrm_state_get_afinfo(proto);
+247	if (!afinfo)
+248		return;
+249
+250	afinfo->local_error(skb, mtu);  //<<--
+251	xfrm_state_put_afinfo(afinfo);   
+
+struct xfrm_state_afinfo란 구조체에서 local_error란 멤버의 오프셋 주소가 얼마인지 알아볼까요?
+예를 들어서, bald_manager란 구조체가 있으면, issue 멤버는 0x4, issue_list 멤버는 0x8 오프셋이라고 볼 수 있어요.
+struct bald_manager {
+	int phone;
+	int issue;
+	struct list_head issue_list;
+}; 
+
+음, 이럴 때 커널 패닉을 디버깅하는 Crash Tool이란 좋은 툴에서 아주 유용한 기능을 제공하거든요.
+아래와 같은 명령어를 입력하면, local_error 멤버의 오프셋이 0x44c임을 알 수 있어요.
+crash> struct -o xfrm_state_afinfo.local_error
+struct xfrm_state_afinfo {
+  [0x44c] void (*local_error)(struct sk_buff *, u32);
+}
+
+어떤 T32 매니아가 저에게 질문을 던지네요.
+음 T32로는 확인할 수 없냐구요? 아래 매크로 기능으로 확인 가능해요.
+
+T32로 아래 명령어를 입력하면 되요.
+sYmbol.NEW.MACRO offsetof(type,member) ((int)(&((type*)0)->member))
+
+이게 제가 뚝딱만든 코드는 아니구요. 이미 리눅스 커널 코드에 있는 매크로를 그대로 가져온 거거든요.
+[android/kernel/include/linux/stddef.h]
+#define offsetof(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
+
+요렇게 입력하면 똑같은 0x044C 오프셋 주소를 확인할 수 있어요. T32로 디버깅할 때 자주 쓰면 좋아요.
+v.v %h offsetof(struct xfrm_state_afinfo,local_error)
+  offsetof(struct xfrm_state_afinfo,local_error) = 0x044C
+
+자, 이제 0xC0ADC270 주소에 다시 가보면 [1] instruction이 afinfo->local_error(skb, mtu); 함수 라인에 매핑되는 걸 알 수 있어요.
+   NSR:C0ADC264|E1A00005                        cpy     r0,r5            ; proto,skb
+   NSR:C0ADC268|E594344C                        ldr     r3,[r4,#0x44C]  //<<--[1]
+   250			afinfo->local_error(skb, mtu);  //<<--[1]
+   NSR:C0ADC26C|E1A01006                        cpy     r1,r6            ; r1,mtu
+   NSR:C0ADC270|E12FFF33                        blx     r3
+
+커널 패닉 시 로그를 다시 보면, R4가 0xc13e3780이거든요.
+이 값을 T32로 (struct xfrm_state_afinfo *) 타입으로 캐스팅해서 올려보면,  local_error값이 0x0이네요.
+어라, 그리고 0xC13E3780 주소의 정체가 xfrm4_state_afinfo란 전역 벼수라는 것도 알 수 있네요.
+v.v %all (struct xfrm_state_afinfo *)0xc13e3780
+  (struct xfrm_state_afinfo *) (struct xfrm_state_afinfo *)0xc13e3780 = 0xC13E3780 = xfrm4_state_afinfo -> (
+    (unsigned int) family = 2 = 0x2 = '....',
+    (unsigned int) proto = 4 = 0x4 = '....',
+    (__be16) eth_proto = 8 = 0x8 = '..',
+    (struct module *) owner = 0x0 =  -> NULL,
+    (struct xfrm_type * [256]) type_map = ([0] = 0x0 =  -> NULL, [1] = 0x0 =  -> NULL, [2] = 0x0 =  -> NULL, [3] = 0
+    (struct xfrm_mode * [5]) mode_map = ([0] = 0xC13E31D8 = xfrm4_transport_mode -> ((int (*)()) input2 = 0x0 = , (i
+    (int (*)()) init_flags = 0xC0AD0AD0 = xfrm4_init_flags -> ,
+    (void (*)()) init_tempsel = 0xC0AD0B6C = __xfrm4_init_tempsel -> ,
+    (void (*)()) init_temprop = 0xC0AD0AF4 = xfrm4_init_temprop -> ,
+    (int (*)()) tmpl_sort = 0x0 =  -> NULL,
+    (int (*)()) state_sort = 0x0 =  -> NULL,
+    (int (*)()) output = 0xC0AD12E4 = xfrm4_output -> ,
+    (int (*)()) output_finish = 0xC0AD129C = xfrm4_output_finish -> ,
+    (int (*)()) extract_input = 0xC0AD0D8C = xfrm4_extract_input -> ,
+    (int (*)()) extract_output = 0xC0AD11E0 = xfrm4_extract_output -> ,
+    (int (*)()) transport_finish = 0xC0AD0D94 = xfrm4_transport_finish -> ,
+    (void (*)()) local_error = 0x0 =  -> NULL)  //<<--
+
+    
+이제 정리 좀 하면.
+afinfo->local_error(skb, mtu); 주소가 0x0이라서 커널 패닉으로 타겟이 크래시가 난 거에요.
+참, 결론은 허무하죠. 대부분의 커널 패닉 문제는 허무하게 끝납니다.     
+
+아 이제, 코드 리뷰를 해볼 시간인데. xfrm4_state_afinfo란 변수 선언문을 가보았더니 에서 local_error 멤버를 초기화하지 않고 있네요.
+[kernel/net/ipv4/xfrm4_state.c]
+static struct xfrm_state_afinfo xfrm4_state_afinfo = {
+        .family                 = AF_INET,
+        .proto                  = IPPROTO_IPIP,
+        .eth_proto              = htons(ETH_P_IP),
+        .owner                  = THIS_MODULE,
+        .init_flags             = xfrm4_init_flags,
+        .init_tempsel           = __xfrm4_init_tempsel,
+        .init_temprop           = xfrm4_init_temprop,
+        .output                 = xfrm4_output,
+        .output_finish          = xfrm4_output_finish,
+        .extract_input          = xfrm4_extract_input,
+        .extract_output         = xfrm4_extract_output,
+        .transport_finish       = xfrm4_transport_finish,
+}; 
+
+아래와 같이 local_error 멤버에 대한 콜백 함수를 추가하는 코드를 추가하니 커널 패닉 증상은 사라졌습니다.
+diff --git a/net/ipv4/xfrm4_state.c b/net/ipv4/xfrm4_state.c
+index 9258e75..0b2a064 100644
+--- a/net/ipv4/xfrm4_state.c
++++ b/net/ipv4/xfrm4_state.c
+@@ -83,6 +83,7 @@ static struct xfrm_state_afinfo xfrm4_state_afinfo = {
+        .extract_input          = xfrm4_extract_input,
+        .extract_output         = xfrm4_extract_output,
+        .transport_finish       = xfrm4_transport_finish,
++       .local_error            = xfrm4_local_error,
+ };
